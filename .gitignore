@@ -10,10 +10,10 @@ wheels/
 .ruff_cache/
 .coverage
 
-data/
-runs/
-checkpoints/
-outputs/
+/data/
+/runs/
+/checkpoints/
+/outputs/
 
 .ipynb_checkpoints/
 
