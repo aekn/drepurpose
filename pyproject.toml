@@ -1,0 +1,102 @@
+[project]
+name = "drepurpose"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14.7"
+dependencies = [
+    "huggingface-hub>=1.28.0",
+    "numpy>=2.5.2",
+    "polars>=1.44.1",
+    "pyarrow>=25.0.1",
+    "scikit-learn>=1.9.0",
+    "scipy>=1.18.1",
+    "torch==2.12.1",
+    "torch-geometric==2.8.0",
+    "tqdm>=4.70.0",
+]
+
+[project.scripts]
+drepurpose = "drepurpose.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = [
+    "A",
+    "ASYNC100",
+    "ASYNC110",
+    "ASYNC210",
+    "ASYNC212",
+    "ASYNC220",
+    "ASYNC221",
+    "ASYNC222",
+    "ASYNC230",
+    "ASYNC240",
+    "ASYNC250",
+    "ASYNC251",
+    "B",
+    "C4",
+    "E4",
+    "E7",
+    "E9",
+    "E501",
+    "ERA",
+    "F",
+    "I",
+    "PERF",
+    "PGH",
+    "PIE",
+    "RUF",
+    "T10",
+    "TID252",
+    "UP",
+]
+ignore = ["C416"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+skip-magic-trailing-comma = false
+docstring-code-format = true
+docstring-code-line-length = "dynamic"
+
+
+[tool.pyright]
+pythonVersion = "3.14"
+typeCheckingMode = "strict"
+venvPath = "."
+venv = ".venv"
+
+reportImportCycles = "error"
+reportMatchNotExhaustive = "error"
+reportUnnecessaryCast = "error"
+reportUnnecessaryIsInstance = "error"
+reportUnnecessaryTypeIgnoreComment = "error"
+
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.4",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
