@@ -46,6 +46,14 @@ def _load_manifest(path: Path) -> SourceManifest | None:
     return cast(SourceManifest, json.loads(path.read_text()))
 
 
+def _matches_source(record: SourceRecord, source: SourceFile) -> bool:
+    return (
+        record["identifier"] == source.identifier
+        and record["path"] == source.path
+        and record["url"] == source.url
+    )
+
+
 def _download(source: SourceFile, path: Path) -> tuple[str, int]:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -96,13 +104,21 @@ def fetch_sources(root: Path, *, force: bool = False) -> None:
 
     for source in ALL_SOURCES:
         path = root / source.path
+        previous_record = previous_files.get(source.key)
 
-        if path.exists() and not force:
+        if path.exists() and not force and previous_record is None:
+            raise RuntimeError(f"Untracked source file: {path}; rerun with --force")
+
+        if (
+            path.exists()
+            and not force
+            and previous_record is not None
+            and _matches_source(previous_record, source)
+        ):
             digest = sha256_file(path)
             size = path.stat().st_size
 
-            previous_record = previous_files.get(source.key)
-            if previous_record is not None and previous_record["sha256"] != digest:
+            if previous_record["sha256"] != digest:
                 raise RuntimeError(f"SHA-256 mismatch: {path}")
         else:
             digest, size = _download(source, path)
@@ -150,6 +166,8 @@ def audit_sources(root: Path) -> None:
         record = manifest["files"].get(source.key)
         if record is None:
             raise RuntimeError(f"Missing manifest entry: {source.key}")
+        if not _matches_source(record, source):
+            raise RuntimeError(f"Source metadata mismatch: {source.key}")
 
         digest = sha256_file(path)
         if digest != record["sha256"]:

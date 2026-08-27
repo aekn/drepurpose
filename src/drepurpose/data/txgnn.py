@@ -36,10 +36,14 @@ THERAPEUTIC_RELATIONS = (
     "off-label use",
 )
 
-_EDGE_COLUMNS = (
+_KG_COLUMNS = (
     "x_index",
-    "y_index",
+    "x_type",
+    "x_id",
     "relation",
+    "y_index",
+    "y_type",
+    "y_id",
 )
 
 
@@ -86,42 +90,6 @@ def _descendants(children: dict[str, set[str]], root: str) -> set[str]:
             descendants[parent] = values | grandchildren
 
     return {root, *descendants.get(root, set())}
-
-
-def _indexed_kg(edges: pd.DataFrame, nodes: pd.DataFrame) -> pd.DataFrame:
-    if not nodes.node_index.is_unique:
-        raise RuntimeError("PrimeKG node indices are not unique")
-
-    node_indices = pd.Index(nodes.node_index)
-    missing_x = ~edges.x_index.isin(node_indices)
-    missing_y = ~edges.y_index.isin(node_indices)
-
-    if missing_x.any() or missing_y.any():
-        raise RuntimeError(
-            "PrimeKG edges reference unknown nodes: "
-            f"{int(missing_x.sum()):,} sources, {int(missing_y.sum()):,} targets"
-        )
-
-    node_metadata = nodes.set_index("node_index")[["node_id", "node_type"]]
-    x_metadata = node_metadata.rename(columns={"node_id": "x_id", "node_type": "x_type"})
-    y_metadata = node_metadata.rename(columns={"node_id": "y_id", "node_type": "y_type"})
-
-    return (
-        edges.join(x_metadata, on="x_index", validate="many_to_one")
-        .join(y_metadata, on="y_index", validate="many_to_one")
-        .loc[
-            :,
-            [
-                "x_index",
-                "x_type",
-                "x_id",
-                "relation",
-                "y_index",
-                "y_type",
-                "y_id",
-            ],
-        ]
-    )
 
 
 def _disease_nodes(raw_root: Path, root: str, nodes: pd.DataFrame) -> np.ndarray:
@@ -206,7 +174,7 @@ def _mark_test_region(kg: pd.DataFrame, test_pairs: pd.DataFrame) -> pd.DataFram
 
     missing = int((matched._merge == "left_only").sum())
     if missing:
-        raise RuntimeError(f"{missing:,} sampled edge pairs are absent from PrimeKG")
+        raise RuntimeError(f"{missing:,} sampled edge pairs are absent from kg.csv")
 
     train = kg.copy()
     train["split"] = "train"
@@ -369,15 +337,24 @@ def _filter_test_diseases(
     reverse_therapeutic = test.relation.isin(reverse_relations)
     wrong_disease = reverse_therapeutic & ~test.x_idx.isin(target_indices)
 
-    return test.loc[~wrong_disease].reset_index(drop=True), len(target_indices)
+    filtered = test.loc[~wrong_disease].reset_index(drop=True)
+    final_disease_count = filtered.loc[
+        filtered.relation.isin(reverse_relations), "y_index"
+    ].nunique()
+
+    return filtered, int(final_disease_count)
 
 
 def build_disease_area_split(raw_root: Path, area: DiseaseArea, seed: int) -> TxGNNSplit:
     primekg = raw_root / "primekg"
 
+    kg = pd.read_csv(primekg / "kg.csv", usecols=_KG_COLUMNS, low_memory=False)
     nodes = pd.read_csv(primekg / "nodes.csv", sep="\t", low_memory=False)
-    edges = pd.read_csv(primekg / "edges.csv", usecols=_EDGE_COLUMNS, low_memory=False)
-    kg = _indexed_kg(edges, nodes)
+    edges = pd.read_csv(
+        primekg / "edges.csv",
+        usecols=("x_index", "y_index", "relation"),
+        low_memory=False,
+    )
 
     disease_nodes = _disease_nodes(raw_root, DISEASE_AREAS[area], nodes)
     test_pairs = _test_pairs(edges, disease_nodes, seed)

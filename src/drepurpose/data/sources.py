@@ -34,8 +34,8 @@ PRIMEKG_SOURCES = (
     SourceFile(
         key="primekg-kg",
         path="primekg/kg.csv",
-        url=f"{_DATAVERSE}/6180626",
-        identifier="harvard-dataverse:6180626",
+        url=f"{_DATAVERSE}/6180620",
+        identifier="harvard-dataverse:6180620",
     ),
     SourceFile(
         key="primekg-nodes",
