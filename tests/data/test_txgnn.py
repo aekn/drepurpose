@@ -1,12 +1,73 @@
 import pandas as pd
+import pytest
 
-from drepurpose.data.txgnn import _convert_id, _descendants, _train_valid_test
+from drepurpose.data.txgnn import _convert_id, _descendants, _indexed_kg, _train_valid_test
 
 
 def test_descendants_include_root_and_transitive_children() -> None:
     children = {"1": {"2", "3"}, "2": {"4"}, "4": {"5"}}
 
     assert _descendants(children, "1") == {"1", "2", "3", "4", "5"}
+
+
+def test_indexed_kg_joins_edge_indices_to_nodes() -> None:
+    nodes = pd.DataFrame(
+        {
+            "node_index": [0, 1, 2],
+            "node_id": ["drug-a", "disease-a", "gene-a"],
+            "node_type": ["drug", "disease", "gene/protein"],
+        }
+    )
+    edges = pd.DataFrame(
+        {
+            "x_index": [0, 2],
+            "y_index": [1, 1],
+            "relation": ["indication", "disease_protein"],
+        }
+    )
+
+    kg = _indexed_kg(edges, nodes)
+
+    assert kg.to_dict("records") == [
+        {
+            "x_index": 0,
+            "x_type": "drug",
+            "x_id": "drug-a",
+            "relation": "indication",
+            "y_index": 1,
+            "y_type": "disease",
+            "y_id": "disease-a",
+        },
+        {
+            "x_index": 2,
+            "x_type": "gene/protein",
+            "x_id": "gene-a",
+            "relation": "disease_protein",
+            "y_index": 1,
+            "y_type": "disease",
+            "y_id": "disease-a",
+        },
+    ]
+
+
+def test_indexed_kg_rejects_unknown_node_indices() -> None:
+    nodes = pd.DataFrame(
+        {
+            "node_index": [0],
+            "node_id": ["drug-a"],
+            "node_type": ["drug"],
+        }
+    )
+    edges = pd.DataFrame(
+        {
+            "x_index": [0],
+            "y_index": [999],
+            "relation": ["indication"],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="unknown nodes"):
+        _indexed_kg(edges, nodes)
 
 
 def test_convert_id_matches_txgnn_normalization() -> None:
