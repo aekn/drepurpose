@@ -375,7 +375,7 @@ def _filter_test_diseases(
 def build_disease_area_split(raw_root: Path, area: DiseaseArea, seed: int) -> TxGNNSplit:
     primekg = raw_root / "primekg"
 
-    nodes = pd.read_csv(primekg / "nodes.csv", low_memory=False)
+    nodes = pd.read_csv(primekg / "nodes.csv", sep="\t", low_memory=False)
     edges = pd.read_csv(primekg / "edges.csv", usecols=_EDGE_COLUMNS, low_memory=False)
     kg = _indexed_kg(edges, nodes)
 
