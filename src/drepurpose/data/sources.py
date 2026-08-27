@@ -68,14 +68,14 @@ TXGNN_SOURCES = (
         key="txgnn-grouped-diseases",
         path="txgnn-1000aac/kg_grouped_diseases_bert_map.csv",
         url=f"{_TXGNN_RAW}/txgnn/data_splits/kg_grouped_diseases_bert_map.csv",
-        identifier=(f"github:mims-harvard/TxGNN@{TXGNN_COMMIT}:kg_grouped_diseases_bert_map.csv"),
+        identifier=f"github:mims-harvard/TxGNN@{TXGNN_COMMIT}:kg_grouped_diseases_bert_map.csv",
     ),
     *(
         SourceFile(
             key=f"txgnn-disease-{area}",
             path=f"txgnn-1000aac/disease_files/{area}.csv",
             url=f"{_TXGNN_RAW}/txgnn/disease_files/{area}.csv",
-            identifier=(f"github:mims-harvard/TxGNN@{TXGNN_COMMIT}:disease_files/{area}.csv"),
+            identifier=f"github:mims-harvard/TxGNN@{TXGNN_COMMIT}:disease_files/{area}.csv",
         )
         for area in _DISEASE_AREAS
     ),

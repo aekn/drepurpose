@@ -43,24 +43,23 @@ def _load_manifest(path: Path) -> SourceManifest | None:
     if not path.exists():
         return None
 
-    return cast(SourceManifest, json.loads(path.read_text(encoding="utf-8")))
+    return cast(SourceManifest, json.loads(path.read_text()))
 
 
-def _download(source: SourceFile, destination: Path) -> tuple[str, int]:
-    destination.parent.mkdir(parents=True, exist_ok=True)
+def _download(source: SourceFile, path: Path) -> tuple[str, int]:
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    temporary = destination.with_name(f"{destination.name}.part")
+    temporary = path.with_suffix(path.suffix + ".part")
     temporary.unlink(missing_ok=True)
 
     request = Request(source.url, headers={"User-Agent": "drepurpose/0.1"})
-
     digest = sha256()
     size = 0
 
     try:
         with urlopen(request) as response, temporary.open("wb") as file:
             content_length = response.headers.get("Content-Length")
-            total = int(content_length) if content_length else None
+            total = int(content_length) if content_length is not None else None
 
             with tqdm(
                 total=total,
@@ -75,7 +74,7 @@ def _download(source: SourceFile, destination: Path) -> tuple[str, int]:
                     size += len(chunk)
                     progress.update(len(chunk))
 
-        temporary.replace(destination)
+        temporary.replace(path)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -90,31 +89,23 @@ def fetch_sources(root: Path, *, force: bool = False) -> None:
     previous = _load_manifest(manifest_path)
 
     if previous is not None and previous["txgnn_commit"] != TXGNN_COMMIT:
-        raise RuntimeError(
-            f"{manifest_path} was created from TxGNN commit "
-            f"{previous['txgnn_commit']}, expected {TXGNN_COMMIT}."
-        )
+        raise RuntimeError(f"TxGNN commit mismatch: {previous['txgnn_commit']} != {TXGNN_COMMIT}")
 
     previous_files = previous["files"] if previous is not None else {}
     records: dict[str, SourceRecord] = {}
 
     for source in ALL_SOURCES:
-        destination = root / source.path
+        path = root / source.path
 
-        if destination.exists() and not force:
-            digest = sha256_file(destination)
-            size = destination.stat().st_size
+        if path.exists() and not force:
+            digest = sha256_file(path)
+            size = path.stat().st_size
 
             previous_record = previous_files.get(source.key)
             if previous_record is not None and previous_record["sha256"] != digest:
-                raise RuntimeError(
-                    f"{destination} does not match its recorded SHA-256. "
-                    "Delete it or fetch again with --force."
-                )
-
-            print(f"Found {source.path}")
+                raise RuntimeError(f"SHA-256 mismatch: {path}")
         else:
-            digest, size = _download(source, destination)
+            digest, size = _download(source, path)
 
         records[source.key] = {
             "identifier": source.identifier,
@@ -131,12 +122,8 @@ def fetch_sources(root: Path, *, force: bool = False) -> None:
         "files": records,
     }
 
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-
-    print(f"Wrote {manifest_path}")
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    print(manifest_path)
 
 
 def _csv_columns(path: Path) -> tuple[str, ...]:
@@ -149,15 +136,10 @@ def audit_sources(root: Path) -> None:
     manifest = _load_manifest(manifest_path)
 
     if manifest is None:
-        raise FileNotFoundError(
-            f"No manifest found at {manifest_path}. Fetch the data first."
-        )
+        raise FileNotFoundError(manifest_path)
 
     if manifest["txgnn_commit"] != TXGNN_COMMIT:
-        raise RuntimeError(
-            f"Manifest uses TxGNN commit {manifest['txgnn_commit']}, "
-            f"expected {TXGNN_COMMIT}."
-        )
+        raise RuntimeError(f"TxGNN commit mismatch: {manifest['txgnn_commit']} != {TXGNN_COMMIT}")
 
     for source in ALL_SOURCES:
         path = root / source.path
@@ -165,19 +147,16 @@ def audit_sources(root: Path) -> None:
         if not path.exists():
             raise FileNotFoundError(path)
 
-        expected = manifest["files"].get(source.key)
-        if expected is None:
-            raise RuntimeError(f"{source.key} is missing from {manifest_path}")
+        record = manifest["files"].get(source.key)
+        if record is None:
+            raise RuntimeError(f"Missing manifest entry: {source.key}")
 
         digest = sha256_file(path)
-
-        if digest != expected["sha256"]:
-            raise RuntimeError(f"SHA-256 mismatch for {path}")
+        if digest != record["sha256"]:
+            raise RuntimeError(f"SHA-256 mismatch: {path}")
 
         size_mib = path.stat().st_size / 1024**2
-        print(f"{source.key}: {size_mib:.1f} MiB  sha256={digest[:12]}...")
+        print(f"{source.key}  {size_mib:.1f} MiB  {digest[:12]}")
 
         if path.suffix == ".csv":
-            print(f"  columns: {', '.join(_csv_columns(path))}")
-
-    print("All source files match the manifest.")
+            print("  " + ", ".join(_csv_columns(path)))
