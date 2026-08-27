@@ -29,8 +29,22 @@ def test_primekg_sources_match_txgnn() -> None:
 
 
 def test_txgnn_sources_are_commit_pinned() -> None:
-    assert len(TXGNN_SOURCES) == 3
+    assert len(TXGNN_SOURCES) == 8
     assert len(TXGNN_COMMIT) == 40
 
     for source in TXGNN_SOURCES:
         assert TXGNN_COMMIT in source.url
+
+
+def test_all_disease_area_files_are_pinned() -> None:
+    disease_sources = [
+        source for source in TXGNN_SOURCES if source.key.startswith("txgnn-disease-")
+    ]
+
+    assert {source.key for source in disease_sources} == {
+        "txgnn-disease-adrenal_gland",
+        "txgnn-disease-anemia",
+        "txgnn-disease-cardiovascular",
+        "txgnn-disease-cell_proliferation",
+        "txgnn-disease-mental_health",
+    }

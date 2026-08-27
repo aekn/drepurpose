@@ -13,6 +13,14 @@ TXGNN_COMMIT = "1000aac7120e0022af09a3ef93dba219e16a094b"
 _DATAVERSE = "https://dataverse.harvard.edu/api/access/datafile"
 _TXGNN_RAW = f"https://raw.githubusercontent.com/mims-harvard/TxGNN/{TXGNN_COMMIT}"
 
+_DISEASE_AREAS = (
+    "adrenal_gland",
+    "anemia",
+    "cardiovascular",
+    "cell_proliferation",
+    "mental_health",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class SourceFile:
@@ -60,9 +68,16 @@ TXGNN_SOURCES = (
         key="txgnn-grouped-diseases",
         path="txgnn-1000aac/kg_grouped_diseases_bert_map.csv",
         url=f"{_TXGNN_RAW}/txgnn/data_splits/kg_grouped_diseases_bert_map.csv",
-        identifier=(
-            f"github:mims-harvard/TxGNN@{TXGNN_COMMIT}:kg_grouped_diseases_bert_map.csv"
-        ),
+        identifier=(f"github:mims-harvard/TxGNN@{TXGNN_COMMIT}:kg_grouped_diseases_bert_map.csv"),
+    ),
+    *(
+        SourceFile(
+            key=f"txgnn-disease-{area}",
+            path=f"txgnn-1000aac/disease_files/{area}.csv",
+            url=f"{_TXGNN_RAW}/txgnn/disease_files/{area}.csv",
+            identifier=(f"github:mims-harvard/TxGNN@{TXGNN_COMMIT}:disease_files/{area}.csv"),
+        )
+        for area in _DISEASE_AREAS
     ),
 )
 
