@@ -8,12 +8,13 @@ __all__ = (
 )
 
 import json
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import polars as pl
 
-from .source import SourceSnapshot
+from .source import EDGE_FILES, NODE_FILES, SourceSnapshot
 
 THERAPEUTIC_RELATIONS = (
     "INDICATION",
@@ -48,6 +49,29 @@ class CountDistribution:
 
 
 @dataclass(frozen=True, slots=True)
+class ComponentAudit:
+    edges: int
+    nodes: int
+    components: int
+    largest_component: int
+    size_histogram: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class ProvenanceAudit:
+    direct: dict[str, int]
+    indirect: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _EndpointAudit:
+    orphan_source_edges: int
+    orphan_target_edges: int
+    endpoint_type_mismatches: int
+    endpoint_type_mismatch_counts: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
 class IndicationAudit:
     edges: int
     diseases: int
@@ -70,28 +94,30 @@ class DrugAudit:
     approval: dict[str, int]
     status: dict[str, int]
     indication_drug_approval: dict[str, int]
-    parent_edges: int
-    parent_drugs: int
+    parent_graph: ComponentAudit
 
 
 @dataclass(frozen=True, slots=True)
 class AuditReport:
     dataset_doi: str
-    dataset_server: str
-    client_version: str
     files: dict[str, dict[str, str | int]]
+    source_size: int
     node_count: int
     edge_count: int
+    largest_connected_component_nodes: int
+    largest_connected_component_edges: int
     node_types: dict[str, int]
     edge_types: dict[str, int]
     edge_relations: dict[str, int]
+    edge_directionality: dict[str, int]
     null_node_ids: int
     null_edge_fields: int
     duplicate_node_ids: int
-    duplicate_edges: int
+    duplicate_edge_keys: int
     orphan_source_edges: int
     orphan_target_edges: int
     endpoint_type_mismatches: int
+    endpoint_type_mismatch_counts: dict[str, int]
     directionality_conflicts: int
     self_loops: int
     typed_view_matches: dict[str, bool]
@@ -104,6 +130,7 @@ class AuditReport:
     disease_gene_evidence: dict[str, NumericSummary]
     anatomy_gene_relations: dict[str, int]
     anatomy_gene_quality: dict[str, int]
+    edge_provenance: dict[str, ProvenanceAudit]
 
 
 def _scan(path: Path) -> pl.LazyFrame:
@@ -111,12 +138,12 @@ def _scan(path: Path) -> pl.LazyFrame:
 
 
 def _require_columns(frame: pl.LazyFrame, path: Path, required: tuple[str, ...]) -> None:
-    available = set(frame.collect_schema().names())
-    missing = set(required) - available
+    columns = set(frame.collect_schema().names())
+    missing = set(required) - columns
 
     if missing:
         names = ", ".join(sorted(missing))
-        raise RuntimeError(f"{path.name} is missing required columns: {names}")
+        raise RuntimeError(f"{path} is missing required columns: {names}")
 
 
 def _count(frame: pl.LazyFrame) -> int:
@@ -124,10 +151,10 @@ def _count(frame: pl.LazyFrame) -> int:
 
 
 def _counts(frame: pl.LazyFrame, *columns: str) -> dict[str, int]:
-    result = frame.group_by(*columns).len().sort(*columns).collect()
+    rows = frame.group_by(*columns).len().sort(*columns).collect()
     counts: dict[str, int] = {}
 
-    for row in result.iter_rows():
+    for row in rows.iter_rows():
         values = row[:-1]
         count = row[-1]
         key = "/".join("null" if value is None else str(value) for value in values)
@@ -142,6 +169,10 @@ def _value_counts(frame: pl.LazyFrame, expression: pl.Expr) -> dict[str, int]:
 
 def _property(name: str) -> pl.Expr:
     return pl.col("properties").struct.field(name)
+
+
+def _nonempty_string(expression: pl.Expr) -> pl.Expr:
+    return expression.is_not_null() & (expression != "")
 
 
 def _count_distribution(frame: pl.LazyFrame, column: str) -> CountDistribution:
@@ -161,7 +192,7 @@ def _count_distribution(frame: pl.LazyFrame, column: str) -> CountDistribution:
         p90=float(summary["p90"].item()),
         p99=float(summary["p99"].item()),
         maximum=int(summary["maximum"].item()),
-        histogram={str(count): int(size) for count, size in histogram.iter_rows()},
+        histogram={str(value): int(count) for value, count in histogram.iter_rows()},
     )
 
 
@@ -205,40 +236,133 @@ def _numeric_summaries(
     return result
 
 
-def _nonempty_string(expression: pl.Expr) -> pl.Expr:
-    return expression.is_not_null() & (expression != "")
+def _duplicate_edge_keys(edges: pl.LazyFrame) -> int:
+    keys = edges.select(
+        pl.when(pl.col("undirected") & (pl.col("from") > pl.col("to")))
+        .then(pl.col("to"))
+        .otherwise(pl.col("from"))
+        .alias("left"),
+        pl.when(pl.col("undirected") & (pl.col("from") > pl.col("to")))
+        .then(pl.col("from"))
+        .otherwise(pl.col("to"))
+        .alias("right"),
+        "label",
+        "relation",
+        "undirected",
+    )
+
+    return int(
+        keys.group_by("left", "right", "label", "relation", "undirected")
+        .len()
+        .filter(pl.col("len") > 1)
+        .select((pl.col("len") - 1).sum().fill_null(0))
+        .collect()
+        .item()
+    )
+
+
+def _audit_endpoints(
+    nodes: pl.LazyFrame,
+    edges: pl.LazyFrame,
+) -> _EndpointAudit:
+    node_labels = nodes.select(
+        "id",
+        pl.col("label").alias("node_label"),
+    )
+
+    typed_edges = (
+        edges.select("from", "to", "label", "relation", "undirected")
+        .join(node_labels, left_on="from", right_on="id", how="left")
+        .rename({"node_label": "from_label"})
+        .join(node_labels, left_on="to", right_on="id", how="left")
+        .rename({"node_label": "to_label"})
+    )
+
+    label_parts = pl.col("label").str.split_exact("-", 1)
+    expected_from = label_parts.struct.field("field_0")
+    expected_to = label_parts.struct.field("field_1")
+
+    forward = (pl.col("from_label") == expected_from) & (pl.col("to_label") == expected_to)
+    reverse = (pl.col("from_label") == expected_to) & (pl.col("to_label") == expected_from)
+    valid = pl.when(pl.col("undirected")).then(forward | reverse).otherwise(forward)
+
+    mismatches = typed_edges.filter(
+        pl.col("from_label").is_not_null() & pl.col("to_label").is_not_null() & ~valid
+    )
+
+    summary = typed_edges.select(
+        pl.col("from_label").is_null().sum().alias("orphan_sources"),
+        pl.col("to_label").is_null().sum().alias("orphan_targets"),
+    ).collect()
+
+    return _EndpointAudit(
+        orphan_source_edges=int(summary["orphan_sources"].item()),
+        orphan_target_edges=int(summary["orphan_targets"].item()),
+        endpoint_type_mismatches=_count(mismatches),
+        endpoint_type_mismatch_counts=_counts(
+            mismatches,
+            "label",
+            "relation",
+            "from_label",
+            "to_label",
+        ),
+    )
+
+
+def _typed_view_matches(
+    snapshot: SourceSnapshot,
+    node_types: dict[str, int],
+    edge_types: dict[str, int],
+) -> dict[str, bool]:
+    matches: dict[str, bool] = {}
+
+    for label, path in NODE_FILES.items():
+        frame = _scan(snapshot.path(path))
+        _require_columns(frame, snapshot.path(path), _NODE_COLUMNS)
+
+        label_matches = bool(frame.select((pl.col("label") == label).all()).collect().item())
+        matches[path] = _count(frame) == node_types.get(label, 0) and label_matches
+
+    for label, path in EDGE_FILES.items():
+        frame = _scan(snapshot.path(path))
+        _require_columns(frame, snapshot.path(path), _EDGE_COLUMNS)
+
+        label_matches = bool(frame.select((pl.col("label") == label).all()).collect().item())
+        matches[path] = _count(frame) == edge_types.get(label, 0) and label_matches
+
+    return matches
 
 
 def _audit_identity(
     diseases: pl.LazyFrame,
     phenotypes: pl.LazyFrame,
 ) -> IdentityAudit:
-    disease_primary = diseases.select(
+    disease_cuis = diseases.select(
         "id",
         _property("umls_cui").alias("cui"),
     ).filter(_nonempty_string(pl.col("cui")))
 
-    phenotype_primary = phenotypes.select(
+    phenotype_cuis = phenotypes.select(
         "id",
         _property("umls_cui").alias("cui"),
     ).filter(_nonempty_string(pl.col("cui")))
 
     duplicate_groups = (
-        disease_primary.group_by("cui")
+        disease_cuis.group_by("cui")
         .agg(pl.col("id").n_unique().alias("nodes"))
         .filter(pl.col("nodes") > 1)
     )
 
-    duplicate_group_count = _count(duplicate_groups)
-    duplicate_node_count = int(
-        duplicate_groups.select((pl.col("nodes") - 1).sum().fill_null(0)).collect().item()
+    disease_primary_cui_duplicate_groups = _count(duplicate_groups)
+    disease_primary_cui_duplicate_nodes = int(
+        duplicate_groups.select(pl.col("nodes").sum().fill_null(0)).collect().item()
     )
 
-    shared_primary = _count(
-        disease_primary.select("cui")
+    disease_phenotype_shared_primary_cuis = _count(
+        disease_cuis.select("cui")
         .unique()
         .join(
-            phenotype_primary.select("cui").unique(),
+            phenotype_cuis.select("cui").unique(),
             on="cui",
             how="inner",
         )
@@ -257,7 +381,7 @@ def _audit_identity(
         .unique()
     )
 
-    shared_concepts = _count(
+    disease_phenotype_shared_concept_ids = _count(
         disease_concepts.join(
             phenotype_concepts,
             on="concept_id",
@@ -266,10 +390,55 @@ def _audit_identity(
     )
 
     return IdentityAudit(
-        disease_primary_cui_duplicate_groups=duplicate_group_count,
-        disease_primary_cui_duplicate_nodes=duplicate_node_count,
-        disease_phenotype_shared_primary_cuis=shared_primary,
-        disease_phenotype_shared_concept_ids=shared_concepts,
+        disease_primary_cui_duplicate_groups=disease_primary_cui_duplicate_groups,
+        disease_primary_cui_duplicate_nodes=disease_primary_cui_duplicate_nodes,
+        disease_phenotype_shared_primary_cuis=disease_phenotype_shared_primary_cuis,
+        disease_phenotype_shared_concept_ids=disease_phenotype_shared_concept_ids,
+    )
+
+
+def _component_audit(frame: pl.LazyFrame) -> ComponentAudit:
+    pairs = frame.select("from", "to").collect()
+
+    if pairs.is_empty():
+        return ComponentAudit(
+            edges=0,
+            nodes=0,
+            components=0,
+            largest_component=0,
+            size_histogram={},
+        )
+
+    parent: dict[str, str] = {}
+
+    def find(node: str) -> str:
+        parent.setdefault(node, node)
+
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+
+        return node
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for left, right in pairs.iter_rows():
+        union(str(left), str(right))
+
+    sizes = Counter(find(node) for node in parent)
+    histogram = Counter(sizes.values())
+
+    return ComponentAudit(
+        edges=pairs.height,
+        nodes=len(parent),
+        components=len(sizes),
+        largest_component=max(sizes.values()),
+        size_histogram={str(size): count for size, count in sorted(histogram.items())},
     )
 
 
@@ -286,16 +455,7 @@ def _audit_drugs(
 
     indication_drugs = indications.select(pl.col("from").alias("id")).unique()
     indication_drug_info = drug_info.join(indication_drugs, on="id", how="inner")
-
     parent_edges = drug_drug.filter(pl.col("relation") == "PARENT")
-    parent_drugs = _count(
-        pl.concat(
-            (
-                parent_edges.select(pl.col("from").alias("id")),
-                parent_edges.select(pl.col("to").alias("id")),
-            )
-        ).unique()
-    )
 
     return DrugAudit(
         approval=_value_counts(drug_info, pl.col("is_approved")),
@@ -304,13 +464,16 @@ def _audit_drugs(
             indication_drug_info,
             pl.col("is_approved"),
         ),
-        parent_edges=_count(parent_edges),
-        parent_drugs=parent_drugs,
+        parent_graph=_component_audit(parent_edges),
     )
 
 
 def _audit_indications(drug_disease: pl.LazyFrame) -> IndicationAudit:
     indications = drug_disease.filter(pl.col("relation") == "INDICATION")
+
+    if _count(indications) == 0:
+        raise RuntimeError("OptimusKG contains no DRG-DIS/INDICATION edges")
+
     per_disease = indications.group_by("to").agg(pl.len().alias("count"))
     per_drug = indications.group_by("from").agg(pl.len().alias("count"))
 
@@ -327,85 +490,53 @@ def _audit_indications(drug_disease: pl.LazyFrame) -> IndicationAudit:
     )
 
 
+def _provenance(frame: pl.LazyFrame) -> ProvenanceAudit:
+    sources = _property("sources")
+
+    direct = (
+        frame.select(sources.struct.field("direct").alias("source"))
+        .explode("source")
+        .filter(_nonempty_string(pl.col("source")))
+    )
+    indirect = (
+        frame.select(sources.struct.field("indirect").alias("source"))
+        .explode("source")
+        .filter(_nonempty_string(pl.col("source")))
+    )
+
+    return ProvenanceAudit(
+        direct=_counts(direct, "source"),
+        indirect=_counts(indirect, "source"),
+    )
+
+
+def _edge_provenance(snapshot: SourceSnapshot) -> dict[str, ProvenanceAudit]:
+    return {label: _provenance(_scan(snapshot.path(path))) for label, path in EDGE_FILES.items()}
+
+
 def audit_source(snapshot: SourceSnapshot) -> AuditReport:
     nodes = _scan(snapshot.path("nodes.parquet"))
     edges = _scan(snapshot.path("edges.parquet"))
-    drugs = _scan(snapshot.path("nodes/drug.parquet"))
-    diseases = _scan(snapshot.path("nodes/disease.parquet"))
-    phenotypes = _scan(snapshot.path("nodes/phenotype.parquet"))
-    drug_disease = _scan(snapshot.path("edges/drug_disease.parquet"))
-    drug_phenotype = _scan(snapshot.path("edges/drug_phenotype.parquet"))
-    drug_drug = _scan(snapshot.path("edges/drug_drug.parquet"))
-    disease_gene = _scan(snapshot.path("edges/disease_gene.parquet"))
-    anatomy_gene = _scan(snapshot.path("edges/anatomy_gene.parquet"))
+    lcc_nodes = _scan(snapshot.path("largest_connected_component_nodes.parquet"))
+    lcc_edges = _scan(snapshot.path("largest_connected_component_edges.parquet"))
 
     _require_columns(nodes, snapshot.path("nodes.parquet"), _NODE_COLUMNS)
     _require_columns(edges, snapshot.path("edges.parquet"), _EDGE_COLUMNS)
+    _require_columns(
+        lcc_nodes,
+        snapshot.path("largest_connected_component_nodes.parquet"),
+        _NODE_COLUMNS,
+    )
+    _require_columns(
+        lcc_edges,
+        snapshot.path("largest_connected_component_edges.parquet"),
+        _EDGE_COLUMNS,
+    )
 
     node_types = _counts(nodes, "label")
     edge_types = _counts(edges, "label")
 
-    node_labels = nodes.select(
-        "id",
-        pl.col("label").alias("node_label"),
-    )
-    typed_edges = (
-        edges.select("from", "to", "label")
-        .join(
-            node_labels,
-            left_on="from",
-            right_on="id",
-            how="left",
-        )
-        .rename({"node_label": "from_label"})
-        .join(
-            node_labels,
-            left_on="to",
-            right_on="id",
-            how="left",
-        )
-        .rename({"node_label": "to_label"})
-    )
-
-    label_parts = pl.col("label").str.split_exact("-", 1)
-    endpoint_summary = typed_edges.select(
-        pl.col("from_label").is_null().sum().alias("orphan_source"),
-        pl.col("to_label").is_null().sum().alias("orphan_target"),
-        (
-            pl.col("from_label").is_not_null()
-            & pl.col("to_label").is_not_null()
-            & (
-                (pl.col("from_label") != label_parts.struct.field("field_0"))
-                | (pl.col("to_label") != label_parts.struct.field("field_1"))
-            )
-        )
-        .sum()
-        .alias("type_mismatches"),
-    ).collect()
-
-    duplicate_node_ids = int(
-        nodes.group_by("id")
-        .len()
-        .filter(pl.col("len") > 1)
-        .select((pl.col("len") - 1).sum().fill_null(0))
-        .collect()
-        .item()
-    )
-
-    duplicate_edges = int(
-        edges.group_by(
-            "from",
-            "to",
-            "label",
-            "relation",
-            "undirected",
-        )
-        .len()
-        .filter(pl.col("len") > 1)
-        .select((pl.col("len") - 1).sum().fill_null(0))
-        .collect()
-        .item()
-    )
+    endpoints = _audit_endpoints(nodes, edges)
 
     directionality_conflicts = _count(
         edges.group_by("label", "relation")
@@ -416,14 +547,22 @@ def audit_source(snapshot: SourceSnapshot) -> AuditReport:
     therapeutic = edges.filter(pl.col("relation").is_in(THERAPEUTIC_RELATIONS))
     adverse = edges.filter(pl.col("relation").is_in(ADVERSE_RELATIONS))
 
-    drug_disease_conflicts = _count(
+    drugs = _scan(snapshot.path(NODE_FILES["DRG"]))
+    diseases = _scan(snapshot.path(NODE_FILES["DIS"]))
+    phenotypes = _scan(snapshot.path(NODE_FILES["PHE"]))
+    drug_disease = _scan(snapshot.path(EDGE_FILES["DRG-DIS"]))
+    drug_drug = _scan(snapshot.path(EDGE_FILES["DRG-DRG"]))
+    disease_gene = _scan(snapshot.path(EDGE_FILES["DIS-GEN"]))
+    anatomy_gene = _scan(snapshot.path(EDGE_FILES["ANA-GEN"]))
+
+    indications = drug_disease.filter(pl.col("relation") == "INDICATION")
+
+    drug_disease_conflict_pairs = _count(
         drug_disease.filter(pl.col("relation").is_in(THERAPEUTIC_RELATIONS))
         .group_by("from", "to")
         .agg(pl.col("relation").n_unique().alias("relations"))
         .filter(pl.col("relations") > 1)
     )
-
-    indications = drug_disease.filter(pl.col("relation") == "INDICATION")
 
     evidence_fields = (
         "evidence_score",
@@ -444,27 +583,18 @@ def audit_source(snapshot: SourceSnapshot) -> AuditReport:
         for file in snapshot.files
     }
 
-    typed_view_matches = {
-        "nodes/drug.parquet": _count(drugs) == node_types.get("DRG", 0),
-        "nodes/disease.parquet": _count(diseases) == node_types.get("DIS", 0),
-        "nodes/phenotype.parquet": _count(phenotypes) == node_types.get("PHE", 0),
-        "edges/drug_disease.parquet": _count(drug_disease) == edge_types.get("DRG-DIS", 0),
-        "edges/drug_phenotype.parquet": _count(drug_phenotype) == edge_types.get("DRG-PHE", 0),
-        "edges/drug_drug.parquet": _count(drug_drug) == edge_types.get("DRG-DRG", 0),
-        "edges/disease_gene.parquet": _count(disease_gene) == edge_types.get("DIS-GEN", 0),
-        "edges/anatomy_gene.parquet": _count(anatomy_gene) == edge_types.get("ANA-GEN", 0),
-    }
-
     return AuditReport(
         dataset_doi=snapshot.doi,
-        dataset_server=snapshot.server,
-        client_version=snapshot.client_version,
         files=files,
+        source_size=sum(file.size for file in snapshot.files),
         node_count=_count(nodes),
         edge_count=_count(edges),
+        largest_connected_component_nodes=_count(lcc_nodes),
+        largest_connected_component_edges=_count(lcc_edges),
         node_types=node_types,
         edge_types=edge_types,
         edge_relations=_counts(edges, "label", "relation"),
+        edge_directionality=_counts(edges, "label", "relation", "undirected"),
         null_node_ids=int(nodes.select(pl.col("id").is_null().sum()).collect().item()),
         null_edge_fields=int(
             edges.select(
@@ -481,23 +611,32 @@ def audit_source(snapshot: SourceSnapshot) -> AuditReport:
             .collect()
             .item()
         ),
-        duplicate_node_ids=duplicate_node_ids,
-        duplicate_edges=duplicate_edges,
-        orphan_source_edges=int(endpoint_summary["orphan_source"].item()),
-        orphan_target_edges=int(endpoint_summary["orphan_target"].item()),
-        endpoint_type_mismatches=int(endpoint_summary["type_mismatches"].item()),
+        duplicate_node_ids=int(
+            nodes.group_by("id")
+            .len()
+            .filter(pl.col("len") > 1)
+            .select((pl.col("len") - 1).sum().fill_null(0))
+            .collect()
+            .item()
+        ),
+        duplicate_edge_keys=_duplicate_edge_keys(edges),
+        orphan_source_edges=endpoints.orphan_source_edges,
+        orphan_target_edges=endpoints.orphan_target_edges,
+        endpoint_type_mismatches=endpoints.endpoint_type_mismatches,
+        endpoint_type_mismatch_counts=endpoints.endpoint_type_mismatch_counts,
         directionality_conflicts=directionality_conflicts,
         self_loops=_count(edges.filter(pl.col("from") == pl.col("to"))),
-        typed_view_matches=typed_view_matches,
+        typed_view_matches=_typed_view_matches(snapshot, node_types, edge_types),
         therapeutic_edges=_counts(therapeutic, "label", "relation"),
         adverse_edges=_counts(adverse, "label", "relation"),
-        drug_disease_conflict_pairs=drug_disease_conflicts,
+        drug_disease_conflict_pairs=drug_disease_conflict_pairs,
         indications=_audit_indications(drug_disease),
         identity=_audit_identity(diseases, phenotypes),
         drugs=_audit_drugs(drugs, indications, drug_drug),
         disease_gene_evidence=_numeric_summaries(disease_gene, evidence_fields),
         anatomy_gene_relations=_counts(anatomy_gene, "relation"),
         anatomy_gene_quality=_value_counts(anatomy_gene, _property("call_quality")),
+        edge_provenance=_edge_provenance(snapshot),
     )
 
 
@@ -519,19 +658,19 @@ def validate_audit(report: AuditReport) -> None:
     if report.orphan_target_edges:
         failures.append(f"edges with missing target nodes: {report.orphan_target_edges:,}")
 
-    if report.endpoint_type_mismatches:
-        failures.append(f"edge endpoint type mismatches: {report.endpoint_type_mismatches:,}")
-
     if report.directionality_conflicts:
         failures.append(f"relation directionality conflicts: {report.directionality_conflicts:,}")
 
-    mismatched_views = [name for name, matches in report.typed_view_matches.items() if not matches]
+    if report.largest_connected_component_nodes > report.node_count:
+        failures.append("largest connected component has more nodes than the full graph")
+
+    if report.largest_connected_component_edges > report.edge_count:
+        failures.append("largest connected component has more edges than the full graph")
+
+    mismatched_views = [path for path, matches in report.typed_view_matches.items() if not matches]
 
     if mismatched_views:
-        failures.append("typed views do not match unified tables: " + ", ".join(mismatched_views))
-
-    if report.indications.edges == 0:
-        failures.append("no DRG-DIS/INDICATION edges found")
+        failures.append("typed views disagree with unified graph: " + ", ".join(mismatched_views))
 
     if failures:
         details = "\n".join(f"- {failure}" for failure in failures)
@@ -540,11 +679,4 @@ def validate_audit(report: AuditReport) -> None:
 
 def write_audit(report: AuditReport, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            asdict(report),
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
-    )
+    path.write_text(json.dumps(asdict(report), indent=2, sort_keys=True) + "\n")

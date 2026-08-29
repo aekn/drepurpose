@@ -1,13 +1,12 @@
 [project]
 name = "drepurpose"
 version = "0.1.0"
-description = ""
+description = "Drug repurposing research on OptimusKG"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "numpy>=2.5.2",
-    "optimuskg>=1.0.0",
-    "polars>=1.44.1",
+    "polars>=1.44.1,<2",
     "torch==2.12.1",
     "torch-geometric==2.8.0",
 ]
@@ -21,7 +20,6 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "huggingface-hub>=1.28.0",
     "pyright>=1.1.411",
     "pytest>=9.1.1",
     "ruff>=0.16.4",
