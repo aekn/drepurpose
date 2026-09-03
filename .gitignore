@@ -10,7 +10,6 @@ wheels/
 .ruff_cache/
 .coverage
 
-/data/
 /runs/
 /checkpoints/
 /outputs/
